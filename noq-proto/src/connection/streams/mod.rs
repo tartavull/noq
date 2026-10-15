@@ -307,7 +307,9 @@ impl<'a> SendStream<'a> {
         self.state.data_sent += written.bytes as u64;
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
-        if !was_pending {
+        // A redundant stream stays pending while copies are in flight, but leaves the queue once
+        // every path has carried them.
+        if !was_pending || stream.affinity == StreamAffinity::Redundant {
             self.state
                 .pending
                 .push_pending(self.id, stream.priority, stream.affinity);
@@ -340,7 +342,7 @@ impl<'a> SendStream<'a> {
 
         let was_pending = stream.is_pending();
         stream.finish()?;
-        if !was_pending {
+        if !was_pending || stream.affinity == StreamAffinity::Redundant {
             self.state
                 .pending
                 .push_pending(self.id, stream.priority, stream.affinity);
@@ -421,22 +423,23 @@ impl<'a> SendStream<'a> {
         if stream.affinity == new_affinity {
             return Ok(());
         }
-        if stream.affinity == StreamAffinity::Block {
-            if !stream.is_reset() && stream.is_pending() {
-                self.state
-                    .pending
-                    .push_pending(self.id, stream.priority, new_affinity);
-            }
-        } else {
-            match new_affinity {
-                StreamAffinity::Any => self.state.pending.move_pending(self.id, None),
-                StreamAffinity::Sticky(path) => {
-                    self.state.pending.move_pending(self.id, Some(path))
+        let old_affinity = stream.affinity;
+        stream.set_affinity(new_affinity);
+        match Bucket::of(new_affinity) {
+            None => self.state.pending.remove(self.id),
+            Some(bucket) => {
+                if old_affinity != StreamAffinity::Block {
+                    self.state.pending.move_pending(self.id, bucket);
                 }
-                StreamAffinity::Block => self.state.pending.remove(self.id),
+                // Queues a stream coming out of `Block`, and a stream turning redundant whose
+                // in-flight data the other paths have not copied yet.
+                if !stream.is_reset() && stream.is_pending() {
+                    self.state
+                        .pending
+                        .push_pending(self.id, stream.priority, new_affinity);
+                }
             }
         }
-        stream.affinity = new_affinity;
         Ok(())
     }
 
@@ -463,16 +466,46 @@ pub enum StreamAffinity {
     Any,
     /// Uses only this path, overriding available/backup preference but not transport limits.
     Sticky(PathId),
+    /// Sends a copy of the stream's data on every path that may carry data.
+    ///
+    /// The paths are the ones [`StreamAffinity::Any`] would use: every available path, or the
+    /// backup paths when none is available. Data counts as delivered when any copy is
+    /// acknowledged, and no path sends a copy of data that is already acknowledged. This trades
+    /// bandwidth for latency: each packet arrives over whichever path is fastest at that moment,
+    /// and a path that stalls does not hold up delivery.
+    Redundant,
     /// Prevents transmission of STREAM frames for this stream.
     Block,
+}
+
+/// The queue a pending stream waits in
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bucket {
+    Any,
+    Sticky(PathId),
+    Redundant,
+}
+
+impl Bucket {
+    /// The queue for a stream with this affinity, or `None` for a blocked stream
+    fn of(affinity: StreamAffinity) -> Option<Self> {
+        match affinity {
+            StreamAffinity::Any => Some(Self::Any),
+            StreamAffinity::Sticky(path) => Some(Self::Sticky(path)),
+            StreamAffinity::Redundant => Some(Self::Redundant),
+            StreamAffinity::Block => None,
+        }
+    }
 }
 
 /// Pending streams partitioned by affinity, with shared priority and fairness ordering.
 struct PendingStreamsQueue {
     any: BinaryHeap<PendingStream>,
     sticky: FxHashMap<PathId, BinaryHeap<PendingStream>>,
+    /// Redundant streams. Every path reads this queue and takes the streams it has not copied yet.
+    redundant: BinaryHeap<PendingStream>,
     /// Used as a sort of "reverse index" to find in which queue a stream is currently pending.
-    affinities: FxHashMap<StreamId, Option<PathId>>,
+    affinities: FxHashMap<StreamId, Bucket>,
     /// A monotonically decreasing counter, used to implement round-robin scheduling for streams of
     /// the same priority. Underflowing is not a practical concern, as it is initialized to
     /// u64::MAX and only decremented by 1 in `push_pending`
@@ -484,6 +517,7 @@ impl PendingStreamsQueue {
         Self {
             any: BinaryHeap::new(),
             sticky: FxHashMap::default(),
+            redundant: BinaryHeap::new(),
             affinities: FxHashMap::default(),
             recency: u64::MAX,
         }
@@ -493,17 +527,15 @@ impl PendingStreamsQueue {
     ///
     /// Ignores blocked streams and preserves any existing queued entry and its turn.
     fn push_pending(&mut self, id: StreamId, priority: i32, affinity: StreamAffinity) {
-        let sticky = match affinity {
-            StreamAffinity::Any => None,
-            StreamAffinity::Sticky(path) => Some(path),
-            StreamAffinity::Block => return,
+        let Some(bucket) = Bucket::of(affinity) else {
+            return;
         };
         // Empty writes and late ACKs can leave an entry queued without pending work.
         // Re-enqueueing that stream keeps its existing turn rather than duplicating it.
         match self.affinities.entry(id) {
             hash_map::Entry::Occupied(_) => return,
             hash_map::Entry::Vacant(entry) => {
-                entry.insert(sticky);
+                entry.insert(bucket);
             }
         }
         // As the recency counter is monotonically decreasing, we know that using its value to sort
@@ -513,7 +545,7 @@ impl PendingStreamsQueue {
         // handled, and then immediately reinserted.
         self.recency -= 1;
         let recency = self.recency;
-        self.queue_mut(sticky).push(PendingStream {
+        self.queue_mut(bucket).push(PendingStream {
             priority,
             recency,
             id,
@@ -523,29 +555,58 @@ impl PendingStreamsQueue {
     /// Removes the highest-ranked entry eligible for this path.
     ///
     /// Includes the [`StreamAffinity::Any`] queue only when `include_affinity_any` is true.
+    ///
+    /// Redundant streams follow the same rule as [`StreamAffinity::Any`]. A popped redundant
+    /// stream may have nothing left for this path; put it back with [`Self::restore`].
     fn pop(&mut self, path: PathId, include_affinity_any: bool) -> Option<PendingStream> {
-        let any = include_affinity_any.then(|| self.any.peek()).flatten();
-        let sticky = self.sticky.get(&path).and_then(|q| q.peek());
-        let pending = if any > sticky {
-            self.queue_mut(None).pop()
-        } else {
-            sticky?; // skip looking at the sticky map, if none exists.
-            self.queue_mut(Some(path)).pop()
-        }?;
+        let tops = [
+            (
+                Bucket::Any,
+                include_affinity_any
+                    .then(|| self.any.peek().cloned())
+                    .flatten(),
+            ),
+            (
+                Bucket::Sticky(path),
+                self.sticky.get(&path).and_then(|q| q.peek().cloned()),
+            ),
+            (
+                Bucket::Redundant,
+                include_affinity_any
+                    .then(|| self.redundant.peek().cloned())
+                    .flatten(),
+            ),
+        ];
+        let (bucket, _) = tops
+            .into_iter()
+            .filter_map(|(bucket, top)| Some((bucket, top?)))
+            .max_by(|a, b| a.1.cmp(&b.1))?;
+        let pending = self.queue_mut(bucket).pop()?;
         self.affinities.remove(&pending.id);
         Some(pending)
+    }
+
+    /// Puts back an entry that [`Self::pop`] returned, keeping its turn
+    fn restore(&mut self, pending: PendingStream, affinity: StreamAffinity) {
+        let Some(bucket) = Bucket::of(affinity) else {
+            return;
+        };
+        if let hash_map::Entry::Vacant(entry) = self.affinities.entry(pending.id) {
+            entry.insert(bucket);
+            self.queue_mut(bucket).push(pending);
+        }
     }
 
     /// Moves a queued stream to the destination bucket, preserving priority and recency.
     ///
     /// Does nothing if the stream is not queued.
-    fn move_pending(&mut self, id: StreamId, new_affinity: Option<PathId>) {
-        let Some(affinity) = self.affinities.get_mut(&id) else {
+    fn move_pending(&mut self, id: StreamId, new_bucket: Bucket) {
+        let Some(bucket) = self.affinities.get_mut(&id) else {
             return;
         };
-        let old_affinity = std::mem::replace(affinity, new_affinity);
+        let old_bucket = core::mem::replace(bucket, new_bucket);
         let mut moved = None;
-        self.queue_mut(old_affinity).retain(|pending| {
+        self.queue_mut(old_bucket).retain(|pending| {
             if pending.id == id {
                 moved = Some(pending.clone());
                 false
@@ -553,13 +614,14 @@ impl PendingStreamsQueue {
                 true
             }
         });
-        self.queue_mut(new_affinity).extend(moved);
+        self.queue_mut(new_bucket).extend(moved);
     }
 
-    fn queue_mut(&mut self, sticky: Option<PathId>) -> PendingQueueMut<'_> {
-        match sticky {
-            None => PendingQueueMut::Any(&mut self.any),
-            Some(path) => {
+    fn queue_mut(&mut self, bucket: Bucket) -> PendingQueueMut<'_> {
+        match bucket {
+            Bucket::Any => PendingQueueMut::Shared(&mut self.any),
+            Bucket::Redundant => PendingQueueMut::Shared(&mut self.redundant),
+            Bucket::Sticky(path) => {
                 let entry = match self.sticky.entry(path) {
                     hash_map::Entry::Occupied(entry) => entry,
                     hash_map::Entry::Vacant(entry) => entry.insert_entry(BinaryHeap::new()),
@@ -570,35 +632,38 @@ impl PendingStreamsQueue {
     }
 
     fn remove(&mut self, id: StreamId) {
-        let Some(sticky) = self.affinities.remove(&id) else {
+        let Some(bucket) = self.affinities.remove(&id) else {
             return;
         };
         // Abandoned-path queues might never be selected again.
-        self.queue_mut(sticky).retain(|pending| pending.id != id);
+        self.queue_mut(bucket).retain(|pending| pending.id != id);
     }
 
     fn clear(&mut self) {
         self.any.clear();
         self.sticky.clear();
+        self.redundant.clear();
         self.affinities.clear();
     }
 
     fn iter(&self, path: PathId, include_any: bool) -> impl Iterator<Item = &PendingStream> {
         include_any
-            .then_some(&self.any)
+            .then_some([&self.any, &self.redundant])
             .into_iter()
+            .flatten()
             .flat_map(|q| q.iter())
             .chain(self.sticky.get(&path).into_iter().flat_map(|q| q.iter()))
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.any.len() + self.sticky.values().map(|q| q.len()).sum::<usize>()
+        self.any.len() + self.redundant.len() + self.sticky.values().map(|q| q.len()).sum::<usize>()
     }
 }
 
 enum PendingQueueMut<'a> {
-    Any(&'a mut BinaryHeap<PendingStream>),
+    /// A queue every eligible path reads
+    Shared(&'a mut BinaryHeap<PendingStream>),
     // The entry is present until Drop takes ownership to remove an empty bucket.
     Sticky(Option<hash_map::OccupiedEntry<'a, PathId, BinaryHeap<PendingStream>>>),
 }
@@ -608,7 +673,7 @@ impl Deref for PendingQueueMut<'_> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Any(queue) => queue,
+            Self::Shared(queue) => queue,
             Self::Sticky(entry) => entry.as_ref().expect("entry is present until drop").get(),
         }
     }
@@ -617,7 +682,7 @@ impl Deref for PendingQueueMut<'_> {
 impl DerefMut for PendingQueueMut<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::Any(queue) => queue,
+            Self::Shared(queue) => queue,
             Self::Sticky(entry) => entry
                 .as_mut()
                 .expect("entry is present until drop")

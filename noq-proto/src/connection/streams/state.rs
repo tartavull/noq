@@ -6,8 +6,8 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
-    StreamHalf,
+    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamAffinity,
+    StreamEvent, StreamHalf,
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, PathId, Side, StreamId, TransportError, VarInt,
@@ -396,7 +396,7 @@ impl StreamsState {
             self.send
                 .get(&stream.id)
                 .and_then(|s| s.as_ref())
-                .is_some_and(|s| !s.is_reset() && s.is_pending())
+                .is_some_and(|s| !s.is_reset() && s.is_pending_on(path))
         })
     }
 
@@ -525,6 +525,9 @@ impl StreamsState {
         path: PathId,
         status_allows_data: bool,
     ) {
+        // Redundant streams this path has already copied, put back for the other paths once this
+        // packet is full
+        let mut copied = Vec::new();
         while builder.frame_space_remaining() > frame::Stream::SIZE_BOUND {
             // Pop the stream of the highest priority that currently has pending data. If
             // the stream still has some pending data left after writing, it will be
@@ -545,11 +548,15 @@ impl StreamsState {
             if stream.is_reset() || !stream.is_pending() {
                 continue;
             }
+            if !stream.is_pending_on(path) {
+                copied.push((pending, stream.affinity));
+                continue;
+            }
 
             // Now that we know the `StreamId`, we can better account for how many bytes
             // are required to encode it.
             let max_buf_size = builder.frame_space_remaining() - 1 - VarInt::size(id.into());
-            let (offsets, encode_length) = stream.pending.poll_transmit(max_buf_size);
+            let (offsets, encode_length) = stream.pending.poll_transmit_on(path, max_buf_size);
             let fin = offsets.end == stream.pending.offset()
                 && matches!(stream.state, SendState::DataSent { .. });
             if fin {
@@ -570,6 +577,9 @@ impl StreamsState {
             let meta = frame::StreamMeta { id, offsets, fin };
             builder.write_frame(meta.encoder(encode_length), stats);
             stream.pending.get_into(range, builder.buf);
+        }
+        for (pending, affinity) in copied {
+            self.pending.restore(pending, affinity);
         }
     }
 
@@ -604,9 +614,11 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
         let was_pending = stream.is_pending();
-        if !stream.ack(frame) {
+        let acked = stream.ack(frame);
+        // Copies on several paths can acknowledge the same data more than once.
+        self.unacked_data -= acked.newly_acked;
+        if !acked.finished {
             // The stream is unfinished or may still need retransmits
             return;
         }
@@ -624,12 +636,19 @@ impl StreamsState {
             // Loss of data on a closed stream is a noop
             return;
         };
-        if !stream.is_pending() {
+        if !stream.is_pending() || stream.affinity == StreamAffinity::Redundant {
             self.pending
                 .push_pending(frame.id, stream.priority, stream.affinity);
         }
         stream.fin_pending |= frame.fin;
         stream.pending.retransmit(frame.offsets);
+    }
+
+    /// Forgets per-path send state for a path that will not send again
+    pub(crate) fn forget_path(&mut self, path: PathId) {
+        for stream in self.send.values_mut().filter_map(|s| s.as_mut()) {
+            stream.pending.forget_path(path);
+        }
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {
@@ -644,7 +663,7 @@ impl StreamsState {
                     // this stream
                     continue;
                 }
-                if !stream.is_pending() {
+                if !stream.is_pending() || stream.affinity == StreamAffinity::Redundant {
                     self.pending
                         .push_pending(id, stream.priority, stream.affinity);
                 }
@@ -1436,7 +1455,7 @@ mod tests {
         }
 
         // Moving a queued stream keeps its turn relative to streams in the destination bucket.
-        queue.move_pending(ids[0], Some(path));
+        queue.move_pending(ids[0], super::super::Bucket::Sticky(path));
         for id in &ids[..3] {
             assert_eq!(queue.pop(path, true).unwrap().id, *id);
         }

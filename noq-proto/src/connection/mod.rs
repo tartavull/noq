@@ -3471,6 +3471,7 @@ impl Connection {
         self.partial_stats += path_stats;
         self.paths.remove(&path_id);
         self.spaces[SpaceId::Data].number_spaces.remove(&path_id);
+        self.streams.forget_path(path_id);
 
         self.events.push_back(
             PathEvent::Discarded {

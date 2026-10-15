@@ -29,8 +29,8 @@ use rustls::{
 };
 use tracing::{debug, info, info_span, trace};
 
-use crate::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
 use crate::connection::timer::Timer;
+use crate::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
 use crate::{
     ClientConfig, ClosePathError, ClosedPath, Connection, ConnectionError, ConnectionEvent,
     ConnectionHandle, ConnectionStats, DatagramEvent, Datagrams, Dir, Duration, EcnCodepoint,
@@ -1768,6 +1768,13 @@ impl Routing {
         }
     }
 
+    pub(super) fn as_many_to_many_mut(&mut self) -> &mut ManyToManyRouting {
+        match self {
+            Self::ManyToMany(inner) => inner,
+            _ => panic!("cast to ManyToManyRouting failed, a different routing table is set"),
+        }
+    }
+
     /// Sets the one-way latency between the two endpoints.
     pub(super) fn set_latency(&mut self, latency: Duration) {
         match self {
@@ -1914,6 +1921,9 @@ pub(super) struct ManyToManyRouting {
     server_routes: Vec<(SocketAddr, usize)>,
     /// The one-way latency from client to server *and* server to client.
     latency: Duration,
+    /// Extra latency for datagrams sent from a client interface, as when a link holds uplink
+    /// packets for a while
+    client_extra_latency: Vec<(SocketAddr, Duration)>,
 }
 
 impl From<ManyToManyRouting> for Routing {
@@ -1946,7 +1956,7 @@ impl ManyToManyRouting {
             RoutingDecision::Deliver {
                 src: client_addr,
                 dst: Some(transmit.destination.ip()),
-                recv_time: now + self.latency,
+                recv_time: now + self.latency + self.client_extra_latency(client_addr),
                 congestion_experienced: false,
             }
         } else {
@@ -1963,7 +1973,7 @@ impl ManyToManyRouting {
             RoutingDecision::Deliver {
                 src: *client_addr,
                 dst: Some(transmit.destination.ip()),
-                recv_time: now + self.latency,
+                recv_time: now + self.latency + self.client_extra_latency(*client_addr),
                 congestion_experienced: false,
             }
         }
@@ -2061,6 +2071,7 @@ impl ManyToManyRouting {
             client_routes,
             server_routes,
             latency: Duration::from_millis(1),
+            client_extra_latency: Vec::new(),
         }
     }
 
@@ -2088,7 +2099,22 @@ impl ManyToManyRouting {
             client_routes,
             server_routes,
             latency: Duration::from_millis(1),
+            client_extra_latency: Vec::new(),
         }
+    }
+
+    /// Delays every datagram the client sends from `client_addr` by `extra` on top of the latency
+    pub(super) fn set_client_extra_latency(&mut self, client_addr: SocketAddr, extra: Duration) {
+        self.client_extra_latency
+            .retain(|(addr, _)| *addr != client_addr);
+        self.client_extra_latency.push((client_addr, extra));
+    }
+
+    fn client_extra_latency(&self, client_addr: SocketAddr) -> Duration {
+        self.client_extra_latency
+            .iter()
+            .find(|(addr, _)| *addr == client_addr)
+            .map_or(Duration::ZERO, |(_, extra)| *extra)
     }
 
     /// Adds a new route from an existing server address to a new client address.

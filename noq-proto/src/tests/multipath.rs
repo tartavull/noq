@@ -2659,3 +2659,180 @@ fn path_acks_sent_on_own_path() -> TestResult {
     );
     Ok(())
 }
+
+/// Connects a client with two interfaces and opens a second path on the second one.
+///
+/// Returns the pair, the second path's ID and the client interface address the first path uses.
+fn pair_with_second_path(
+    builder: super::util::ConnPairBuilder,
+    second_status: PathStatus,
+) -> Result<(ConnPair, PathId, SocketAddr), Box<dyn core::error::Error>> {
+    let mut pair = builder.connect();
+    let first_client_addr = pair.routes.as_basic().client_addr;
+    let first_server_addr = pair.routes.as_basic().server_addr;
+    let mut second_client_addr = first_client_addr;
+    let mut second_server_addr = first_server_addr;
+    second_client_addr.set_port(second_client_addr.port() + 1);
+    second_server_addr.set_port(second_server_addr.port() + 1);
+    pair.routes = ManyToManyRouting::simple_symmetric(
+        [first_client_addr, second_client_addr],
+        [first_server_addr, second_server_addr],
+    )
+    .into();
+    let second = pair.open_path(
+        Client,
+        FourTuple {
+            local_ip: Some(second_client_addr.ip()),
+            remote: second_server_addr,
+        },
+        second_status,
+    )?;
+    pair.drive();
+    assert_matches!(
+        pair.poll(Client),
+        Some(Event::Path(PathEvent::Established { id })) if id == second
+    );
+    Ok((pair, second, first_client_addr))
+}
+
+#[test]
+fn redundant_stream_uses_every_available_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, second, _) = pair_with_second_path(
+        ConnPair::builder().enable_multipath(),
+        PathStatus::Available,
+    )?;
+    let first = PathId::ZERO;
+    let before = [first, second].map(|path| pair.path_stats(Client, path).unwrap().frame_tx.stream);
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .set_affinity(StreamAffinity::Redundant)?;
+    const MSG: &[u8] = b"a copy on every path";
+    pair.send_stream(Client, stream).write(MSG)?;
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+
+    for (path, before) in [first, second].into_iter().zip(before) {
+        assert!(
+            pair.path_stats(Client, path).unwrap().frame_tx.stream > before,
+            "path {path} should carry a copy"
+        );
+    }
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(true)?;
+    assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes == MSG);
+    assert_matches!(chunks.next(usize::MAX), Ok(None));
+    let _ = chunks.finalize();
+    Ok(())
+}
+
+#[test]
+fn redundant_stream_skips_backup_paths() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup, _) =
+        pair_with_second_path(ConnPair::builder().enable_multipath(), PathStatus::Backup)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap().frame_tx.stream;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .set_affinity(StreamAffinity::Redundant)?;
+    pair.send_stream(Client, stream)
+        .write(b"only the available path")?;
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+
+    assert_eq!(
+        pair.path_stats(Client, backup).unwrap().frame_tx.stream,
+        backup_before,
+        "a backup path carries no copy while another path is available"
+    );
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    Ok(())
+}
+
+/// Steps the pair until the server can read `len` bytes of `stream`, returning how long it took
+fn time_to_read(pair: &mut ConnPair, stream: crate::StreamId, len: usize) -> Duration {
+    let start = pair.time;
+    let mut read = 0;
+    let mut accepted = false;
+    for _ in 0..10_000 {
+        pair.step();
+        if !accepted {
+            accepted = pair.streams(Server).accept(Dir::Uni) == Some(stream);
+        }
+        if accepted {
+            let mut recv = pair.recv_stream(Server, stream);
+            let mut chunks = recv.read(true).unwrap();
+            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                read += chunk.bytes.len();
+            }
+            let _ = chunks.finalize();
+        }
+        if read >= len {
+            return pair.time - start;
+        }
+    }
+    panic!("stream {stream} delivered only {read} of {len} bytes");
+}
+
+/// One link holding uplink packets does not delay a redundant stream
+///
+/// The first path delivers the client's datagrams 300 ms late, as a cellular link does when it
+/// holds uplink packets and then releases them together. A stream that follows the connection's
+/// path choice waits for the held path; a redundant stream arrives over the other path.
+#[test]
+fn redundant_stream_is_not_held_up_by_a_slow_path() -> TestResult {
+    let _guard = subscribe();
+    const HOLD: Duration = Duration::from_millis(300);
+    let (mut pair, _, first_client_ip) = pair_with_second_path(
+        ConnPair::builder().enable_multipath(),
+        PathStatus::Available,
+    )?;
+    pair.routes
+        .as_many_to_many_mut()
+        .set_client_extra_latency(first_client_ip, HOLD);
+
+    let mut elapsed = Vec::new();
+    for affinity in [StreamAffinity::Any, StreamAffinity::Redundant] {
+        let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+        pair.send_stream(Client, stream).set_affinity(affinity)?;
+        const MSG: &[u8] = b"held or not";
+        pair.send_stream(Client, stream).write(MSG)?;
+        elapsed.push(time_to_read(&mut pair, stream, MSG.len()));
+        pair.drive();
+    }
+
+    assert!(
+        elapsed[0] >= HOLD,
+        "the control stream should wait: {elapsed:?}"
+    );
+    assert!(
+        elapsed[1] < HOLD / 10,
+        "the redundant stream should arrive over the other path: {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// Acknowledgements of the copies on both paths free the send window once
+#[test]
+fn redundant_stream_counts_acknowledged_bytes_once() -> TestResult {
+    let _guard = subscribe();
+    const WINDOW: usize = 4_000;
+    let mut builder = ConnPair::builder().enable_multipath();
+    builder.client_transport_cfg.send_window(WINDOW as u64);
+    let (mut pair, _, _) = pair_with_second_path(builder, PathStatus::Available)?;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .set_affinity(StreamAffinity::Redundant)?;
+    // Each write fills the window. It is accepted whole only if the previous write's bytes were
+    // released exactly once, although both paths had their copies acknowledged.
+    for _ in 0..3 {
+        let data = vec![0u8; WINDOW];
+        assert_eq!(pair.send_stream(Client, stream).write(&data)?, WINDOW);
+        pair.drive();
+    }
+    Ok(())
+}

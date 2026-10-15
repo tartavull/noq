@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use super::StreamAffinity;
 use crate::{
-    VarInt,
+    PathId, VarInt,
     connection::{send_buffer::SendBuffer, streams::BytesOrSlice},
     frame,
 };
@@ -114,10 +114,10 @@ impl Send {
         }
     }
 
-    /// Returns whether the stream has been finished and all data has been acknowledged by the peer
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
-        self.pending.ack(frame.offsets);
-        match self.state {
+    /// Records the peer's acknowledgement of a STREAM frame
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> Acked {
+        let newly_acked = self.pending.ack(frame.offsets);
+        let finished = match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
             } => {
@@ -125,7 +125,18 @@ impl Send {
                 *finish_acked && self.pending.is_fully_acked()
             }
             _ => false,
+        };
+        Acked {
+            newly_acked,
+            finished,
         }
+    }
+
+    /// Sets which paths may carry the stream's data
+    pub(super) fn set_affinity(&mut self, affinity: StreamAffinity) {
+        self.pending
+            .set_redundant(affinity == StreamAffinity::Redundant);
+        self.affinity = affinity;
     }
 
     /// Handle increase to stream-level flow control limit
@@ -144,13 +155,32 @@ impl Send {
         self.pending.offset()
     }
 
+    /// Whether some path may still have data or a FIN to send
+    ///
+    /// A redundant stream stays pending until its data is acknowledged, since a path that has not
+    /// carried a copy yet may still send one.
     pub(super) fn is_pending(&self) -> bool {
-        self.pending.has_unsent_data() || self.fin_pending
+        self.pending.has_unsent_data()
+            || self.fin_pending
+            || (self.affinity == StreamAffinity::Redundant && self.pending.unacked() > 0)
+    }
+
+    /// Whether `path` has data or a FIN to send
+    pub(super) fn is_pending_on(&self, path: PathId) -> bool {
+        self.pending.has_unsent_data_on(path) || self.fin_pending
     }
 
     pub(super) fn is_writable(&self) -> bool {
         matches!(self.state, SendState::Ready)
     }
+}
+
+/// The effect of acknowledging one STREAM frame
+pub(super) struct Acked {
+    /// Bytes of the frame that were not acknowledged before
+    pub(super) newly_acked: u64,
+    /// Whether the stream is finished and all its data acknowledged
+    pub(super) finished: bool,
 }
 
 /// A [`BytesSource`] implementation for `&'a mut [Bytes]`

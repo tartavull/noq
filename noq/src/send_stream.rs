@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
-use proto::{ClosedStream, ConnectionError, FinishError, StreamId};
+use proto::{ClosedStream, ConnectionError, FinishError, StreamAffinity, StreamId};
 use thiserror::Error;
 use tokio::sync::futures::OwnedNotified;
 
@@ -230,6 +230,17 @@ impl SendStream {
     pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
         let mut conn = self.conn.lock_without_waking("SendStream::set_priority");
         conn.inner.send_stream(self.stream).set_priority(priority)?;
+        Ok(())
+    }
+
+    /// Set which paths may carry the stream's data
+    ///
+    /// Every send stream starts with [`StreamAffinity::Any`]. See [`StreamAffinity`] for the
+    /// options.
+    pub fn set_affinity(&self, affinity: StreamAffinity) -> Result<(), ClosedStream> {
+        // Another path may now have data to send.
+        let mut conn = self.conn.lock_and_wake("SendStream::set_affinity");
+        conn.inner.send_stream(self.stream).set_affinity(affinity)?;
         Ok(())
     }
 

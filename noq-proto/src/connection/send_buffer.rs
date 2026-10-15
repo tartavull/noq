@@ -1,11 +1,11 @@
-use alloc::collections::VecDeque;
-#[cfg(test)]
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{VarInt, connection::streams::BytesOrSlice, range_set::ArrayRangeSet};
+use rustc_hash::FxHashMap;
+
+use crate::{PathId, VarInt, connection::streams::BytesOrSlice, range_set::ArrayRangeSet};
 
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
@@ -36,6 +36,13 @@ pub(super) struct SendBuffer {
     ///
     /// This should usually not overlap with `acks`, but this is not strictly enforced.
     retransmits: ArrayRangeSet,
+    /// For a redundant stream, the offset from which each path sends its next copy
+    ///
+    /// `None` unless every path carries a copy of the stream's data. A path without an entry
+    /// starts at the oldest unacknowledged offset, so a newly usable path copies everything still
+    /// in flight. Copies skip data that is already acknowledged, so a path that fell behind never
+    /// resends what another path delivered.
+    copies: Option<FxHashMap<PathId, u64>>,
 }
 
 /// Maximum number of bytes to combine into a single segment
@@ -214,12 +221,22 @@ impl SendBuffer {
     }
 
     /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    ///
+    /// Returns how many bytes of `range` were not acknowledged before. A range can be acknowledged
+    /// more than once when copies of it travel on several paths, or when a retransmission and the
+    /// original both arrive.
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> u64 {
         // Clamp the range to data which is still tracked
         let base_offset = self.fully_acked_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
+        let already_acked: u64 = self
+            .acks
+            .iter_range(range.clone())
+            .map(|acked| acked.end - acked.start)
+            .sum();
+        let newly_acked = range.end - range.start - already_acked;
         self.acks.insert(range);
 
         while self.acks.min() == Some(self.fully_acked_offset()) {
@@ -233,6 +250,7 @@ impl SendBuffer {
         // We have to do this since we have just dropped the data, and asking
         // for non-present data would be an error.
         self.retransmits.remove(0..self.fully_acked_offset());
+        newly_acked
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that
@@ -317,13 +335,107 @@ impl SendBuffer {
         // for simplicity. Not doing so would require clipping the range against
         // all acknowledged ranges.
         range.start = range.start.max(self.fully_acked_offset());
-        self.retransmits.insert(range);
+        self.retransmits.insert(range.clone());
+        if self.copies.is_some() {
+            // A lost copy is often already acknowledged through another path.
+            let acked: Vec<Range<u64>> = self.acks.iter_range(range).collect();
+            for acked in acked {
+                self.retransmits.remove(acked);
+            }
+        }
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
         // check that we still got all data - we didn't get any acks.
         debug_assert_eq!(self.fully_acked_offset(), 0);
         self.unsent = 0;
+        if let Some(copies) = &mut self.copies {
+            copies.clear();
+        }
+    }
+
+    /// Starts or stops sending a copy of the stream's data on every path
+    pub(super) fn set_redundant(&mut self, redundant: bool) {
+        if redundant != self.copies.is_some() {
+            self.copies = redundant.then(FxHashMap::default);
+        }
+    }
+
+    /// Whether `path` has stream data to send
+    ///
+    /// That is data lost and awaiting retransmission, data never sent, or for a redundant stream,
+    /// unacknowledged data that `path` has not carried yet.
+    pub(super) fn has_unsent_data_on(&self, path: PathId) -> bool {
+        match &self.copies {
+            None => self.has_unsent_data(),
+            Some(copies) => !self.retransmits.is_empty() || self.next_copy(copies, path).is_some(),
+        }
+    }
+
+    /// Like [`Self::poll_transmit`], but for redundant streams it picks the next range `path` has
+    /// not carried yet
+    ///
+    /// Lost data waiting for retransmission goes first, on whichever path asks first.
+    pub(super) fn poll_transmit_on(&mut self, path: PathId, max_len: usize) -> (Range<u64>, bool) {
+        let Some(copies) = &self.copies else {
+            return self.poll_transmit(max_len);
+        };
+        if !self.retransmits.is_empty() {
+            return self.poll_transmit(max_len);
+        }
+        let Some(range) = self.next_copy(copies, path) else {
+            // Nothing left to copy. Callers ask only to send a FIN.
+            let offset = self.offset();
+            return (offset..offset, true);
+        };
+        let (range, encode_length) = Self::fit(range, max_len);
+        if let Some(copies) = &mut self.copies {
+            copies.insert(path, range.end);
+        }
+        self.unsent = self.unsent.max(range.end);
+        (range, encode_length)
+    }
+
+    /// The first range at or after `path`'s copy offset that is not yet acknowledged
+    fn next_copy(&self, copies: &FxHashMap<PathId, u64>, path: PathId) -> Option<Range<u64>> {
+        let end = self.offset();
+        let mut start = copies
+            .get(&path)
+            .copied()
+            .unwrap_or(0)
+            .max(self.fully_acked_offset());
+        for acked in self.acks.iter_range(start..end) {
+            if acked.start > start {
+                return Some(start..acked.start);
+            }
+            start = acked.end;
+        }
+        (start < end).then_some(start..end)
+    }
+
+    /// Trims `range` to what fits in `max_len` bytes of frame space, as [`Self::poll_transmit`]
+    /// does for new data, and reports whether the length must be encoded
+    fn fit(range: Range<u64>, mut max_len: usize) -> (Range<u64>, bool) {
+        debug_assert!(max_len >= 8 + 8);
+        let mut encode_length = false;
+        // When the offset is known, we know how many bytes are required to encode it.
+        // Offset 0 requires no space. Stream offsets always fit a VarInt.
+        if range.start != 0 {
+            max_len -= VarInt::from_u64(range.start).map_or(8, VarInt::size);
+        }
+        if range.end - range.start < max_len as u64 {
+            encode_length = true;
+            max_len -= 8;
+        }
+        let end = range.end.min((max_len as u64).saturating_add(range.start));
+        (range.start..end, encode_length)
+    }
+
+    /// Forgets the copy offset of a path that will not send again
+    pub(super) fn forget_path(&mut self, path: PathId) {
+        if let Some(copies) = &mut self.copies {
+            copies.remove(&path);
+        }
     }
 
     /// Offset up to which all data has been acknowledged
