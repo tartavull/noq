@@ -2035,6 +2035,33 @@ impl Bbr3Config {
         self.initial_window = value;
         self
     }
+
+    /// Pacing gain over the bandwidth estimate while cruising in ProbeBW and in ProbeRTT.
+    ///
+    /// BBRv3 uses 1.0. An application-limited sender, such as live video, only ever shows BBR
+    /// its own rate, so at 1.0 it is paced at about that rate and has no headroom for bursts.
+    pub fn default_pacing_gain(&mut self, value: f64) -> &mut Self {
+        self.default_pacing_gain = Some(value);
+        self
+    }
+
+    /// Pacing gain in ProbeBW_DOWN. BBRv3 uses 0.9.
+    pub fn probe_bw_down_pacing_gain(&mut self, value: f64) -> &mut Self {
+        self.probe_bw_down_pacing_gain = Some(value);
+        self
+    }
+
+    /// Pacing gain in ProbeBW_UP. BBRv3 uses 1.25.
+    pub fn probe_bw_up_pacing_gain(&mut self, value: f64) -> &mut Self {
+        self.probe_bw_up_pacing_gain = Some(value);
+        self
+    }
+
+    /// Congestion window gain over the bandwidth-delay product in ProbeRTT. BBRv3 uses 0.5.
+    pub fn probe_rtt_cwnd_gain(&mut self, value: f64) -> &mut Self {
+        self.probe_rtt_cwnd_gain = Some(value);
+        self
+    }
 }
 
 impl Default for Bbr3Config {
