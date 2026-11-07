@@ -81,8 +81,8 @@ impl PathId {
         self.saturating_add(Self(1))
     }
 
-    /// Get the underlying u32
-    pub(crate) fn as_u32(&self) -> u32 {
+    /// Get the underlying u32, the number both ends of a connection know the path by
+    pub fn as_u32(&self) -> u32 {
         self.0
     }
 }
